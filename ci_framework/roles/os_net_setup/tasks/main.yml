@@ -1,48 +1,38 @@
-- name: get openstack admin credentials from k8s
-  vars:
-      k8s_kubeconfig: "{{ cifmw_os_net_setup_kudeconfig_location | default(cifmw_install_yamls_vars.KUBECONFIG) | default(ansible_user_dir + '/.crc/machines/crc/kubeconfig') }}"
-      k8s_context: "{{ cifmw_os_net_setup_kubeconfig_context | default('admin') }}"
-  block:
-  - name: Get clouds.yaml configuration
-    kubernetes.core.k8s_info:
-      kubeconfig: "{{ k8s_kubeconfig }}"
-      context: "{{ k8s_context }}"
-      kind: ConfigMap
-      namespace: openstack
-      name: openstack-config
-    register: clouds_yaml
+- name: prepare reproducer script
+  ansible.builtin.copy:
+    dest: "{{ ansible_user_dir }}/oc-get-loop.sh"
+    mode: 0755
+    content: |
+      #!/bin/bash
+      set -x
 
-  - name: Get the OSP admin password
-    kubernetes.core.k8s_info:
-      kubeconfig: "{{ k8s_kubeconfig }}"
-      context: "{{ k8s_context }}"
-      kind: Secret
-      namespace: openstack
-      name: openstack-config-secret
-    register: osp_secret
+      eval $(${HOME}/ci-framework-data/bin/crc oc-env)
+      export KUBECONFIG="${HOME}/.crc/machines/crc/kubeconfig"
 
-- name: Construct auth param for openstack
-  block:
-  - name: Set openstack auth fact
-    ansible.builtin.set_fact:
-      openstack_auth: |
-        {{ ((clouds_yaml.resources[0].data['clouds.yaml']| from_yaml)['clouds']['default'] |
-        combine ({'auth': { 'password' : (osp_secret.resources[0].data['secure.yaml']|b64decode|from_yaml)['clouds']['default']['auth']['password']} }, recursive=true))['auth'] }}
-      region_name: "{{ (clouds_yaml.resources[0].data['clouds.yaml']| from_yaml)['clouds']['default']['region_name'] }}"
-  rescue:
-  - fail:
-      msg: |
-        Failed to Retrive auth Infomation
-        clouds.yaml: {{ clouds_yaml }}
-        osp_secret: {{ osp_secret }}
+      while true; do
+        ons_clouds_yaml=""
+        ons_secret=""
+        tempest_secret=""
+        tempest_endpoint=""
 
-- openstack.cloud.networks_info:
-    auth: "{{ openstack_auth }}"
-  register: net_info
+        ons_clouds_yaml=$(oc get configmap -n openstack openstack-config -o 'jsonpath={.data.clouds\.yaml}')
+        ons_secret=$(oc get secret -n openstack openstack-config-secret -o 'jsonpath={.data.secure\.yaml}')
 
-- name: Process network list element
-  ansible.builtin.include_tasks:
-    file: subtask_net.yml
-  loop: "{{ cifmw_os_net_setup_config|flatten(levels=1) }}"
-  loop_control:
-    loop_var: net_item
+        KEYSCT=$(oc get keystoneapi keystone -o json | jq -r .spec.secret)
+        KEYSEL=$(oc get keystoneapi keystone -o json |jq -r .spec.passwordSelectors.admin)
+        if [[ -n "$KEYSCT" && -n "$KEYSEL" ]]; then
+          tempest_secret=$(oc get secret "$KEYSCT" -o json | jq -r .data."${KEYSEL}" | base64 -d)
+        fi
+
+        tempest_endpoint=$(oc get keystoneapi keystone -o json | jq -r .status.apiEndpoint.public)
+
+        if [[ -z "$ons_clouds_yaml" || -z "$ons_secret" || -z "$tempest_secret" || -z "$tempest_endpoint" ]]; then
+          echo "ERROR: something is missing"
+        fi
+      done
+
+- name: start repeated oc get
+  ansible.builtin.shell:
+    cmd:
+      tmux new-session -A -s debugoc -d;
+      tmux send -t debugoc "timeout 24h {{ ansible_user_dir }}/oc-get-loop.sh |& tee /tmp/oc-get-loop.log" ENTER;
